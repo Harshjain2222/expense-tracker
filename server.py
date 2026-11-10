@@ -1,5 +1,5 @@
 from fastmcp import FastMCP
-from main import app # Import your
+from main import app # Import your  // app.post() this app
 
 # Convert FastAPI app to MCP server
 mcp = FastMCP.from_fastapi(
