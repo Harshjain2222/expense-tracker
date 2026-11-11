@@ -1,131 +1,119 @@
+import os, json, datetime
+from dotenv import load_dotenv
+import asyncpg, jwt
 from fastmcp import FastMCP
-import os
-import aiosqlite  # Changed: sqlite3 → aiosqlite
-import tempfile
-# Use temporary directory which should be writable 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
+from fastmcp.server.dependencies import get_http_headers
 
-print(f"Database path: {DB_PATH}")
-
+load_dotenv()  
 mcp = FastMCP("ExpenseTracker")
 
-def init_db():  # Keep as sync for initialization
-    try:
-        # Use synchronous sqlite3 just for initialization
-        import sqlite3
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS expenses(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    category TEXT NOT NULL,
-                    subcategory TEXT DEFAULT '',
-                    note TEXT DEFAULT ''
-                )
-            """)
-            # Test write access
-            c.execute("INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
-            c.execute("DELETE FROM expenses WHERE category = 'test'")
-            print("Database initialized successfully with write access")
-    except Exception as e:
-        print(f"Database initialization error: {e}")
-        raise
+JWT_SECRET = os.environ["JWT_SECRET"]
+DATABASE_URL = os.environ["DATABASE_URL"]   # pooled Neon URL, WITHOUT &channel_binding=require
+CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-# Initialize database synchronously at module load
-init_db()
+_pool = None
+async def pool():
+    global _pool
+    if _pool is None:
+        # statement_cache_size=0 is required with Neon's pooler (pgbouncer)
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5,
+                                          statement_cache_size=0)
+    return _pool
+
+def current_user_id() -> int:
+    auth = get_http_headers(include_all=True).get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip()
+    try:
+        return int(jwt.decode(token, JWT_SECRET, algorithms=["HS256"])["sub"])
+    except Exception:
+        raise ValueError("Unauthorized: missing or invalid/expired token. Please log in again.")
+
+def _row(r):
+    d = dict(r)
+    d["amount"] = float(d["amount"])
+    d["date"] = d["date"].isoformat()
+    return d
+
+def _d(s): return datetime.date.fromisoformat(s)
 
 @mcp.tool()
-async def add_expense(date, amount, category, subcategory="", note=""):  # Changed: added async
-    '''Add a new expense entry to the database.'''
-    try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
-            cur = await c.execute(  # Changed: added await
-                "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-                (date, amount, category, subcategory, note)
-            )
-            expense_id = cur.lastrowid
-            await c.commit()  # Changed: added await
-            return {"status": "success", "id": expense_id, "message": "Expense added successfully"}
-    except Exception as e:  # Changed: simplified exception handling
-        if "readonly" in str(e).lower():
-            return {"status": "error", "message": "Database is in read-only mode. Check file permissions."}
-        return {"status": "error", "message": f"Database error: {str(e)}"}
-    
-@mcp.tool()
-async def list_expenses(start_date, end_date):  # Changed: added async
-    '''List expense entries within an inclusive date range.'''
-    try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
-            cur = await c.execute(  # Changed: added await
-                """
-                SELECT id, date, amount, category, subcategory, note
-                FROM expenses
-                WHERE date BETWEEN ? AND ?
-                ORDER BY date DESC, id DESC
-                """,
-                (start_date, end_date)
-            )
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
-    except Exception as e:
-        return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
+async def add_expense(amount: float, category: str, date: str, note: str = ""):
+    """Add an expense for the current user. date is YYYY-MM-DD; use today's date if not given."""
+    if amount <= 0:
+        return {"status": "error", "message": "amount must be positive"}
+    uid = current_user_id()
+    p = await pool()
+    row = await p.fetchrow(
+        """INSERT INTO expenses (user_id, amount, category, date, description)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+        uid, round(amount, 2), category.strip(), _d(date), note)
+    return {"status": "success", "id": row["id"]}
 
 @mcp.tool()
-async def summarize(start_date, end_date, category=None):  # Changed: added async
-    '''Summarize expenses by category within an inclusive date range.'''
-    try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
-            query = """
-                SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
-                FROM expenses
-                WHERE date BETWEEN ? AND ?
-            """
-            params = [start_date, end_date]
+async def list_expenses(start_date: str, end_date: str):
+    """List the current user's expenses in an inclusive date range (YYYY-MM-DD)."""
+    uid = current_user_id()
+    p = await pool()
+    rows = await p.fetch(
+        """SELECT id, date, amount, category, description FROM expenses
+           WHERE user_id=$1 AND date BETWEEN $2 AND $3
+           ORDER BY date DESC, id DESC""", uid, _d(start_date), _d(end_date))
+    return [_row(r) for r in rows]
 
-            if category:
-                query += " AND category = ?"
-                params.append(category)
+@mcp.tool()
+async def summarize(start_date: str, end_date: str, category: str | None = None):
+    """Summarize the current user's expenses by category in a date range (YYYY-MM-DD)."""
+    uid = current_user_id()
+    p = await pool()
+    rows = await p.fetch(
+        """SELECT category, SUM(amount) AS total_amount, COUNT(*) AS count FROM expenses
+           WHERE user_id=$1 AND date BETWEEN $2 AND $3 AND ($4::text IS NULL OR category=$4)
+           GROUP BY category ORDER BY total_amount DESC""",
+        uid, _d(start_date), _d(end_date), category)
+    return [{"category": r["category"], "total_amount": float(r["total_amount"]),
+             "count": r["count"]} for r in rows]
 
-            query += " GROUP BY category ORDER BY total_amount DESC"
+@mcp.tool()
+async def update_expense(expense_id: int, amount: float | None = None,
+                         category: str | None = None, date: str | None = None,
+                         note: str | None = None):
+    """Edit one of the current user's expenses. First call list_expenses to find the correct
+    id; if several rows could match, ask the user which one. Pass only the fields to change.
+    date is YYYY-MM-DD. category must be one of: Food & Dining, Transportation, Shopping,
+    Entertainment, Bills & Utilities, Healthcare, Travel, Education, Business, Other."""
+    if amount is not None and amount <= 0:
+        return {"status": "error", "message": "amount must be positive"}
+    uid = current_user_id()
+    p = await pool()
+    old = await p.fetchrow(
+        "SELECT id, date, amount, category, description FROM expenses WHERE id=$1 AND user_id=$2",
+        expense_id, uid)
+    if not old:
+        return {"status": "not_found"}
+    new = await p.fetchrow(
+        """UPDATE expenses SET
+             amount      = COALESCE($3, amount),
+             category    = COALESCE($4, category),
+             date        = COALESCE($5, date),
+             description = COALESCE($6, description)
+           WHERE id=$1 AND user_id=$2
+           RETURNING id, date, amount, category, description""",
+        expense_id, uid,
+        round(amount, 2) if amount is not None else None,
+        category.strip() if category else None,
+        _d(date) if date else None,
+        note)
+    return {"status": "success", "before": _row(old), "after": _row(new)}
 
-            cur = await c.execute(query, params)  # Changed: added await
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
-    except Exception as e:
-        return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
-
-@mcp.resource("expense:///categories", mime_type="application/json")  # Changed: expense:// → expense:///
+@mcp.resource("expense:///categories", mime_type="application/json")
 def categories():
     try:
-        # Provide default categories if file doesn't exist
-        default_categories = {
-            "categories": [
-                "Food & Dining",
-                "Transportation",
-                "Shopping",
-                "Entertainment",
-                "Bills & Utilities",
-                "Healthcare",
-                "Travel",
-                "Education",
-                "Business",
-                "Other"
-            ]
-        }
-        
-        try:
-            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                return f.read()
-        except FileNotFoundError:
-            import json
-            return json.dumps(default_categories, indent=2)
-    except Exception as e:
-        return f'{{"error": "Could not load categories: {str(e)}"}}'
+        with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return json.dumps({"categories": ["Food & Dining", "Transportation", "Shopping",
+            "Entertainment", "Bills & Utilities", "Healthcare", "Travel",
+            "Education", "Business", "Other"]})
 
-# Start the server
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
-    # mcp.run()
